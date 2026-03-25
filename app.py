@@ -1,163 +1,304 @@
-import gradio as gr
-import torch
-import time
-from PIL import Image
-import tempfile
-import os
+import random
+import re
+import unicodedata
+from dataclasses import dataclass
+from typing import List, Tuple
 
-from data.video import save_video
-from wan_loader import load_wan_pipe
-from models.set_condition_branch import set_stand_in
-from preprocessor import FaceProcessor
+import pandas as pd
+import streamlit as st
+from pypdf import PdfReader
 
-print("Loading model, please wait...")
-try:
-    ANTELOPEV2_PATH = "checkpoints/antelopev2"
-    BASE_MODEL_PATH = "checkpoints/base_model/"
-    LORA_MODEL_PATH = "checkpoints/Stand-In/Stand-In_wan2.1_T2V_14B_ver1.0.ckpt"
+st.set_page_config(page_title="FSP Terminoloji Quiz", page_icon="🩺", layout="wide")
 
-    if not os.path.exists(ANTELOPEV2_PATH):
-        raise FileNotFoundError(
-            f"AntelopeV2 checkpoint not found at: {ANTELOPEV2_PATH}"
+
+@dataclass
+class TermPair:
+    colloquial_de: str
+    medical_latin: str
+
+
+def read_uploaded_text(file) -> str:
+    """Read text from uploaded PDF or TXT."""
+    if file is None:
+        return ""
+
+    file_name = file.name.lower()
+    if file_name.endswith(".txt"):
+        return file.getvalue().decode("utf-8", errors="ignore")
+
+    if file_name.endswith(".pdf"):
+        reader = PdfReader(file)
+        pages = []
+        for page in reader.pages:
+            pages.append(page.extract_text() or "")
+        return "\n".join(pages)
+
+    return ""
+
+
+def normalize_for_match(text: str) -> str:
+    """Case-insensitive and umlaut-tolerant normalization."""
+    text = text.strip().lower()
+    replacements = {
+        "ä": "ae",
+        "ö": "oe",
+        "ü": "ue",
+        "ß": "ss",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^a-z0-9\s\-/,]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def extract_pairs_from_text(raw_text: str) -> List[TermPair]:
+    """Extract colloquial-German / medical-Latin term pairs using flexible patterns."""
+    pairs: List[TermPair] = []
+
+    # Pattern 1: separators like / | ; : ->
+    separator_pattern = re.compile(
+        r"^\s*([^\n\r:;|\-]{2,80}?)\s*(?:/|\||;|:|->|=>|=)\s*([^\n\r]{2,120})\s*$"
+    )
+
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line or len(line) < 4:
+            continue
+
+        m = separator_pattern.match(line)
+        if m:
+            left = m.group(1).strip(" -\t")
+            right = m.group(2).strip(" -\t")
+            if left and right and left.lower() != right.lower():
+                pairs.append(TermPair(colloquial_de=left, medical_latin=right))
+            continue
+
+        # Pattern 2: bracket forms (left (right))
+        bracket_match = re.match(r"^(.{2,80}?)\s*\((.{2,120}?)\)\s*$", line)
+        if bracket_match:
+            left = bracket_match.group(1).strip()
+            right = bracket_match.group(2).strip()
+            if left and right and left.lower() != right.lower():
+                pairs.append(TermPair(colloquial_de=left, medical_latin=right))
+
+    return deduplicate_pairs(pairs)
+
+
+def deduplicate_pairs(pairs: List[TermPair]) -> List[TermPair]:
+    seen = set()
+    unique = []
+    for pair in pairs:
+        key = (
+            normalize_for_match(pair.colloquial_de),
+            normalize_for_match(pair.medical_latin),
         )
-    if not os.path.exists(BASE_MODEL_PATH):
-        raise FileNotFoundError(f"Base model not found at: {BASE_MODEL_PATH}")
-    if not os.path.exists(LORA_MODEL_PATH):
-        raise FileNotFoundError(f"LoRA model not found at: {LORA_MODEL_PATH}")
-
-    face_processor = FaceProcessor(antelopv2_path=ANTELOPEV2_PATH)
-    pipe = load_wan_pipe(base_path=BASE_MODEL_PATH, torch_dtype=torch.bfloat16)
-    set_stand_in(pipe, model_path=LORA_MODEL_PATH)
-    print("Model loaded successfully!")
-except Exception as e:
-    print(f"Model loading failed: {e}")
-    with gr.Blocks() as demo:
-        gr.Markdown("# Error: Model Loading Failed")
-        gr.Markdown(f"""
-        Please check the following:
-        1.  Make sure the checkpoint files are placed in the correct directory.
-        2.  Ensure all dependencies are properly installed.
-        3.  Check the console output for detailed error information.
-        
-        **Error details**: {e}
-        """)
-    demo.launch()
-    exit()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(pair)
+    return unique
 
 
-def generate_video(
-    pil_image: Image.Image,
-    prompt: str,
-    seed: int,
-    negative_prompt: str,
-    num_steps: int,
-    fps: int,
-    quality: int,
-):
-    if pil_image is None:
-        raise gr.Error("Please upload a face image first!")
-
-    print("Processing face...")
-    ip_image = face_processor.process(pil_image)
-    print("Face processing completed.")
-
-    print("Generating video...")
-    start_time = time.time()
-    video = pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        seed=int(seed),
-        ip_image=ip_image,
-        num_inference_steps=int(num_steps),
-        tiled=False,
-    )
-    end_time = time.time()
-    print(f"Video generated in {end_time - start_time:.2f} seconds.")
-
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_file:
-        video_path = temp_file.name
-        save_video(video, video_path, fps=int(fps), quality=quality)
-        print(f"Video saved to: {video_path}")
-        return video_path
+def parse_manual_pairs(text: str) -> List[TermPair]:
+    return extract_pairs_from_text(text)
 
 
-with gr.Blocks(theme=gr.themes.Soft(), css="footer {display: none !important}") as demo:
-    gr.Markdown(
-        """
-        # Stand-In IP2V
-        """
+def answer_is_correct(user_answer: str, expected: str) -> bool:
+    user_norm = normalize_for_match(user_answer)
+    expected_options = [x.strip() for x in re.split(r"[,/;|]", expected) if x.strip()]
+    expected_norms = [normalize_for_match(x) for x in expected_options] or [
+        normalize_for_match(expected)
+    ]
+
+    if user_norm in expected_norms:
+        return True
+
+    # Fuzzy-like containment for close forms (e.g. slight word-order variants)
+    for exp in expected_norms:
+        if exp and (user_norm in exp or exp in user_norm):
+            if abs(len(user_norm) - len(exp)) <= 4:
+                return True
+
+    return False
+
+
+def init_state() -> None:
+    defaults = {
+        "pairs": [],
+        "current_idx": None,
+        "score": 0,
+        "asked": 0,
+        "wrong_pool": [],
+        "mode": "Günlük Almanca → Latince",
+        "history": [],
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def pick_next_question(use_wrong_pool: bool = False) -> int | None:
+    pool = st.session_state["wrong_pool"] if use_wrong_pool else list(range(len(st.session_state["pairs"])))
+    if not pool:
+        return None
+    return random.choice(pool)
+
+
+def get_question_and_answer(pair: TermPair, mode: str) -> Tuple[str, str]:
+    if mode == "Günlük Almanca → Latince":
+        return pair.colloquial_de, pair.medical_latin
+    return pair.medical_latin, pair.colloquial_de
+
+
+def render_header() -> None:
+    st.title("🩺 FSP Terminoloji Quiz (Hafif Sürüm)")
+    st.caption(
+        "PDF/TXT dosyandan terimleri çıkar, çift yönlü quiz yap, yanlışları tekrar çöz."
     )
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            gr.Markdown("### 1. Upload a Face Image")
-            input_image = gr.Image(
-                label="Upload Image",
-                type="pil",
-                image_mode="RGB",
-                height=300,
-            )
 
-            gr.Markdown("### 2. Enter Core Parameters")
-            input_prompt = gr.Textbox(
-                label="Prompt",
-                lines=4,
-                value="一位男性舒适地坐在书桌前，正对着镜头，仿佛在与屏幕前的亲友对话。他的眼神专注而温柔，嘴角带着自然的笑意。背景是他精心布置的个人空间，墙上贴着照片和一张世界地图，传达出一种亲密而现代的沟通感。",
-                placeholder="Please enter a detailed description of the scene, character actions, expressions, etc...",
-            )
-
-            input_seed = gr.Slider(
-                label="Seed",
-                minimum=0,
-                maximum=100000,
-                step=1,
-                value=0,
-                info="The same seed and parameters will generate the same result.",
-            )
-
-            with gr.Accordion("Advanced Options", open=False):
-                input_negative_prompt = gr.Textbox(
-                    label="Negative Prompt",
-                    lines=3,
-                    value="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
-                )
-                input_steps = gr.Slider(
-                    label="Inference Steps",
-                    minimum=10,
-                    maximum=50,
-                    step=1,
-                    value=20,
-                    info="More steps may improve details but will take longer to generate.",
-                )
-                output_fps = gr.Slider(
-                    label="Video FPS", minimum=10, maximum=30, step=1, value=25
-                )
-                output_quality = gr.Slider(
-                    label="Video Quality", minimum=1, maximum=10, step=1, value=9
-                )
-
-            generate_btn = gr.Button("Generate Video", variant="primary")
-
-        with gr.Column(scale=1):
-            gr.Markdown("### 3. View Generated Result")
-            output_video = gr.Video(
-                label="Generated Video",
-                height=480,
-            )
-    generate_btn.click(
-        fn=generate_video,
-        inputs=[
-            input_image,
-            input_prompt,
-            input_seed,
-            input_negative_prompt,
-            input_steps,
-            output_fps,
-            output_quality,
-        ],
-        outputs=output_video,
-        api_name="generate_video",
+def render_sidebar() -> None:
+    st.sidebar.header("⚙️ Ayarlar")
+    st.session_state["mode"] = st.sidebar.radio(
+        "Quiz modu",
+        ["Günlük Almanca → Latince", "Latince → Günlük Almanca"],
+        index=0 if st.session_state["mode"] == "Günlük Almanca → Latince" else 1,
     )
+
+    if st.sidebar.button("🔄 Skoru sıfırla"):
+        st.session_state["score"] = 0
+        st.session_state["asked"] = 0
+        st.session_state["wrong_pool"] = []
+        st.session_state["history"] = []
+        st.session_state["current_idx"] = None
+        st.sidebar.success("Skor ve geçmiş sıfırlandı.")
+
+
+def render_ingestion_section() -> None:
+    st.subheader("1) Dosya yükleme (PDF/TXT)")
+    uploaded = st.file_uploader("Dosyanı yükle", type=["pdf", "txt"])
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("📥 Dosyadan terimleri çıkar", use_container_width=True):
+            raw_text = read_uploaded_text(uploaded)
+            if not raw_text:
+                st.warning("Önce PDF/TXT dosyası yükle.")
+                return
+            extracted = extract_pairs_from_text(raw_text)
+            st.session_state["pairs"] = deduplicate_pairs(st.session_state["pairs"] + extracted)
+            st.success(f"{len(extracted)} çift çıkarıldı. Toplam: {len(st.session_state['pairs'])}")
+
+    with col_b:
+        if st.button("🧪 Örnek veriyi yükle", use_container_width=True):
+            with open("sample_data/fsp_terms_sample.txt", "r", encoding="utf-8") as f:
+                extracted = extract_pairs_from_text(f.read())
+            st.session_state["pairs"] = deduplicate_pairs(st.session_state["pairs"] + extracted)
+            st.success(f"Örnekten {len(extracted)} çift eklendi. Toplam: {len(st.session_state['pairs'])}")
+
+
+def render_manual_add_section() -> None:
+    st.subheader("2) Manuel terim ekleme")
+    st.markdown("Her satır için örnek format: `Böbrek taşı / Nephrolithiasis`")
+    manual_text = st.text_area("Terim çiftleri", height=150, placeholder="Halsentzündung / Pharyngitis")
+
+    if st.button("➕ Manuel listeyi ekle"):
+        pairs = parse_manual_pairs(manual_text)
+        if not pairs:
+            st.warning("Uygun format bulunamadı. Ayraç olarak / | ; : kullan.")
+            return
+        st.session_state["pairs"] = deduplicate_pairs(st.session_state["pairs"] + pairs)
+        st.success(f"{len(pairs)} manuel çift eklendi. Toplam: {len(st.session_state['pairs'])}")
+
+
+def render_dataset_preview() -> None:
+    st.subheader("3) Terim listesi")
+    pairs = st.session_state["pairs"]
+    if not pairs:
+        st.info("Henüz terim yok. Dosya yükle veya manuel ekle.")
+        return
+
+    df = pd.DataFrame(
+        [{"Günlük Almanca": p.colloquial_de, "Tıbbi/Latince": p.medical_latin} for p in pairs]
+    )
+    st.dataframe(df, use_container_width=True, height=240)
+
+
+def render_quiz() -> None:
+    st.subheader("4) Quiz")
+    pairs = st.session_state["pairs"]
+    if not pairs:
+        st.info("Quiz başlatmak için önce en az 1 terim çifti ekle.")
+        return
+
+    cols = st.columns([1, 1, 1])
+    with cols[0]:
+        if st.button("🎯 Yeni soru", use_container_width=True):
+            st.session_state["current_idx"] = pick_next_question(use_wrong_pool=False)
+    with cols[1]:
+        if st.button("🔁 Yanlışlardan sor", use_container_width=True):
+            idx = pick_next_question(use_wrong_pool=True)
+            if idx is None:
+                st.warning("Yanlış havuzun boş.")
+            st.session_state["current_idx"] = idx
+    with cols[2]:
+        st.metric("Puan", f"{st.session_state['score']} / {st.session_state['asked']}")
+
+    idx = st.session_state["current_idx"]
+    if idx is None:
+        return
+
+    pair = pairs[idx]
+    question, answer = get_question_and_answer(pair, st.session_state["mode"])
+
+    st.markdown(f"### ❓ Soru: **{question}**")
+    user_answer = st.text_input("Cevabın", key=f"answer_{idx}_{st.session_state['asked']}")
+
+    if st.button("✅ Cevabı kontrol et"):
+        correct = answer_is_correct(user_answer, answer)
+        st.session_state["asked"] += 1
+
+        if correct:
+            st.session_state["score"] += 1
+            st.success("Doğru! 🎉")
+            if idx in st.session_state["wrong_pool"]:
+                st.session_state["wrong_pool"].remove(idx)
+        else:
+            st.error(f"Yanlış. Doğru cevap: {answer}")
+            if idx not in st.session_state["wrong_pool"]:
+                st.session_state["wrong_pool"].append(idx)
+
+        st.session_state["history"].append(
+            {
+                "Soru": question,
+                "Beklenen": answer,
+                "Senin Cevabın": user_answer,
+                "Durum": "Doğru" if correct else "Yanlış",
+            }
+        )
+
+    if st.session_state["history"]:
+        st.markdown("#### Son cevaplar")
+        hist_df = pd.DataFrame(st.session_state["history"][-10:][::-1])
+        st.dataframe(hist_df, use_container_width=True)
+
+
+def main() -> None:
+    init_state()
+    render_header()
+    render_sidebar()
+    render_ingestion_section()
+    st.divider()
+    render_manual_add_section()
+    st.divider()
+    render_dataset_preview()
+    st.divider()
+    render_quiz()
+
 
 if __name__ == "__main__":
-    demo.launch(share=True, server_name="0.0.0.0", server_port=8080)
+    main()
